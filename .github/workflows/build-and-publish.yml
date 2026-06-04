@@ -1,0 +1,141 @@
+name: Build and publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      nifi_tag:
+        description: "apache/nifi tag to build (e.g. 2.9.0)"
+        required: true
+        type: string
+  workflow_call:
+    inputs:
+      nifi_tag:
+        required: true
+        type: string
+    secrets:
+      AGE_SSH_KEY_B64:
+        required: true
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/liquid-nifi
+
+jobs:
+  build:
+    name: build (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Arch label for artifacts
+        run: echo "ARCH=${platform##*/}" >> "$GITHUB_ENV"
+        env:
+          platform: ${{ matrix.platform }}
+
+      - name: Install age
+        run: sudo apt-get update && sudo apt-get install -y age
+
+      - name: Decrypt & extract dilcher theme
+        env:
+          AGE_SSH_KEY_B64: ${{ secrets.AGE_SSH_KEY_B64 }}
+        run: |
+          set -euo pipefail
+          umask 077
+          printf '%s' "$AGE_SSH_KEY_B64" | base64 -d > age_key
+          age -d -i age_key dilcher-theme.tar.gz.age > dilcher-theme.tar.gz
+          tar xzf dilcher-theme.tar.gz            # -> ./dilcher-theme/build/...
+          rm -f age_key dilcher-theme.tar.gz
+          test -d dilcher-theme/build/liquid-ui   # sanity check
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile
+          platforms: ${{ matrix.platform }}
+          build-args: NIFI_TAG=${{ inputs.nifi_tag }}
+          provenance: false
+          cache-from: type=gha,scope=${{ env.ARCH }}
+          cache-to: type=gha,mode=max,scope=${{ env.ARCH }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Export digest
+        run: |
+          mkdir -p "${{ runner.temp }}/digests"
+          digest="${{ steps.build.outputs.digest }}"
+          touch "${{ runner.temp }}/digests/${digest#sha256:}"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: digests-${{ env.ARCH }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v8
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute tags (and whether this is :latest)
+        id: tags
+        run: |
+          set -euo pipefail
+          TAG="${{ inputs.nifi_tag }}"
+          TAG_ARGS="-t ${IMAGE}:${TAG}"
+          # Highest upstream 2.x semver -> that one owns :latest.
+          HIGHEST=$(curl -s \
+            "https://hub.docker.com/v2/repositories/apache/nifi/tags?page_size=100&ordering=last_updated" \
+            | jq -r '.results[].name' \
+            | grep -E '^2\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
+          if [ "$TAG" = "$HIGHEST" ]; then
+            TAG_ARGS="${TAG_ARGS} -t ${IMAGE}:latest"
+          fi
+          echo "Tagging with: ${TAG_ARGS}"
+          echo "tag_args=${TAG_ARGS}" >> "$GITHUB_OUTPUT"
+
+      - name: Create multi-arch manifest from digests
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create ${{ steps.tags.outputs.tag_args }} \
+            $(printf "${IMAGE}@sha256:%s " *)
+
+      - name: Inspect published image
+        run: docker buildx imagetools inspect "${IMAGE}:${{ inputs.nifi_tag }}"
