@@ -1,4 +1,4 @@
-ARG NIFI_TAG
+ARG NIFI_TAG=latest
 FROM apache/nifi:${NIFI_TAG} AS patch
 ARG NIFI_TAG
 USER root:root
